@@ -1,0 +1,3 @@
+[submodule "el_gato"]
+	path = el_gato
+	url = https://github.com/CDCgov/el_gato.git
