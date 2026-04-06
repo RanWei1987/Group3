@@ -7,6 +7,12 @@ staphb/elgato:1.22.0
 /usr/local/bin/el_gato.py
 
 ## Input
+FASTQ files used in this baseline run are downloaded from public
+accessions.
+
+See:
+docs/test_data_download.md
+
 Paired-end Illumina FASTQs:
 - ERR10879100_1.fastq.gz
 - ERR10879100_2.fastq.gz
