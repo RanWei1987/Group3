@@ -29,7 +29,9 @@ From the repository root:
 
 ```bash
 bash scripts/download_test_data.sh
+```
 
+This script uses Docker and will create:
 
 data/
 ├── illumina/
@@ -39,3 +41,5 @@ data/
 └── ont/
     └── sample01/
         └── ERR10879072.fastq.gz
+
+Downloaded data are excluded from Git via .gitignore.
