@@ -66,7 +66,52 @@ process EL_GATO_FASTA {
 
 process FLYE {
 
+    cpus 2
+    memory '6 GB'
+
     publishDir "${params.outdir}/ont/flye", mode: 'copy', overwrite: true
+
+    input:
+    path reads
+
+   output:
+   tuple val(reads), path("assembly.fasta"), path("flye_out")
+
+    script:
+    """
+    flye \
+      --nano-raw ${reads} \
+      --out-dir flye_out \
+      --genome-size 3m \
+      --threads ${task.cpus} \
+      --asm-coverage 10
+
+    cp flye_out/assembly.fasta .
+    """
+}
+
+process SUBSAMPLE_ONT {
+
+        cpus 1
+    memory '1 GB'
+
+    input:
+    path reads
+
+    output:
+    path "subsampled.fastq.gz"
+
+    script:
+    """
+    ls -la ${reads}
+    seqtk sample -s100 ${reads} 5000 | gzip > subsampled.fastq.gz
+    """
+}
+
+process RAVEN {
+
+    cpus 2
+    memory '4 GB'   // MUCH lower than Flye
 
     input:
     path reads
@@ -74,19 +119,22 @@ process FLYE {
     output:
     path "assembly.fasta"
 
+    container 'staphb/raven:latest'
+
     script:
     """
-    flye --nano-raw ${reads} --out-dir flye_out --genome-size 5m --threads ${task.cpus} --asm-coverage 60
-    cp flye_out/assembly.fasta .
+    ls -lh
+    raven -t 1 $reads > assembly.fasta
     """
 }
 
 process MEDAKA {
 
-    publishDir "${params.outdir}/ont/medaka", mode: 'copy', overwrite: true
+    cpus 2
+    memory '6 GB'
 
     input:
-    path assembly
+    tuple path(reads), path(assembly)
 
     output:
     path "consensus.fasta"
@@ -94,9 +142,10 @@ process MEDAKA {
     script:
     """
     medaka_consensus \
-      -i ${assembly} \
+      -i ${reads} \
       -d ${assembly} \
-      -o medaka_out
+      -o medaka_out \
+      -t ${task.cpus}
 
     cp medaka_out/consensus.fasta .
     """
@@ -117,7 +166,7 @@ process EL_GATO_ONT {
     script:
     """
     el_gato.py \
-      --read1 ${fasta} \
+      --assembly ${fasta} \
       --out ont_result
     """
 }
@@ -164,13 +213,24 @@ workflow {
     // ==================================================
      else if( params.read1 ) {
 
-        log.info "RUNNING MODE 3: ONT PIPELINE (SINGLE FASTQ)"
+    log.info "RUNNING MODE 3: ONT PIPELINE (SINGLE FASTQ)"
 
-        Channel.of(file(params.read1))
-            .set { ont_ch }
+    // Single source channel
+    raw_reads = Channel.of(file(params.read1))
 
-        FLYE(ont_ch)
-        MEDAKA(FLYE.out)
-        EL_GATO_ONT(MEDAKA.out)
-    }
+    // STEP 1: subsample
+    subsampled_reads = SUBSAMPLE_ONT(raw_reads)
+
+    // STEP 2: assemble
+    raven_out = RAVEN(subsampled_reads)
+
+    // STEP 3: pair reads + assembly
+    medaka_input = raw_reads.combine(raven_out)
+
+    // STEP 4: polish
+    medaka_out = MEDAKA(medaka_input)
+
+    // STEP 5: final tool
+    EL_GATO_ONT(medaka_out)
+}
 }
