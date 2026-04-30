@@ -11,3 +11,6 @@ results/
 .nextflow/
 work/
 .nextflow.log*
+
+# Databases
+module_db/

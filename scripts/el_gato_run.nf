@@ -5,21 +5,20 @@ nextflow.enable.dsl=2
 // PARAMETERS
 // ======================================================
 
-params.read1    = null
-params.read2    = null
-params.fasta    = null
+params.read1     = null
+params.read2     = null
+params.fasta     = null
 params.sample_id = "sample"
-params.outdir   = "results"
+params.outdir    = "results"
 
 // ======================================================
-// PROCESS: ILLUMINA FASTQ → EL_GATO
+// ILLUMINA MODE
 // ======================================================
 
 process EL_GATO_FASTQ {
 
     container 'staphb/elgato:1.22.0'
-
-    publishDir "${params.outdir}/illumina_fastq", mode: 'copy', overwrite: true
+    publishDir "${params.outdir}/illumina_fastq", mode: 'copy'
 
     input:
     tuple val(sample_id), path(read1), path(read2)
@@ -29,22 +28,14 @@ process EL_GATO_FASTQ {
 
     script:
     """
-    el_gato.py \
-      --read1 ${read1} \
-      --read2 ${read2} \
-      --out ${sample_id}
+    el_gato.py --read1 ${read1} --read2 ${read2} --out ${sample_id}
     """
 }
-
-// ======================================================
-// PROCESS: ILLUMINA FASTA → EL_GATO
-// ======================================================
 
 process EL_GATO_FASTA {
 
     container 'staphb/elgato:1.22.0'
-
-    publishDir "${params.outdir}/illumina_fasta", mode: 'copy', overwrite: true
+    publishDir "${params.outdir}/illumina_fasta", mode: 'copy'
 
     input:
     path fasta
@@ -54,153 +45,220 @@ process EL_GATO_FASTA {
 
     script:
     """
-    el_gato.py \
-      --read1 ${fasta} \
-      --out ${fasta.baseName}
+    el_gato.py --read1 ${fasta} --out ${fasta.baseName}
     """
 }
 
 // ======================================================
-// ONT PIPELINE
+// ONT PIPELINE (CLEAN LINEAR DAG)
 // ======================================================
-
-process FLYE {
-
-    cpus 2
-    memory '6 GB'
-
-    publishDir "${params.outdir}/ont/flye", mode: 'copy', overwrite: true
-
-    input:
-    path reads
-
-   output:
-   tuple val(reads), path("assembly.fasta"), path("flye_out")
-
-    script:
-    """
-    flye \
-      --nano-raw ${reads} \
-      --out-dir flye_out \
-      --genome-size 3m \
-      --threads ${task.cpus} \
-      --asm-coverage 10
-
-    cp flye_out/assembly.fasta .
-    """
-}
 
 process SUBSAMPLE_ONT {
 
-        cpus 1
-    memory '1 GB'
+    container 'staphb/seqtk:latest'
+    publishDir "${params.outdir}/ont/subsample", mode: 'copy'
 
     input:
-    path reads
+    tuple val(sample_id), path(reads)
 
     output:
-    path "subsampled.fastq.gz"
+    tuple val(sample_id), path("subsampled.fastq.gz")
 
     script:
     """
-    ls -la ${reads}
     seqtk sample -s100 ${reads} 5000 | gzip > subsampled.fastq.gz
     """
 }
 
 process RAVEN {
 
-    cpus 2
-    memory '4 GB'   // MUCH lower than Flye
+    container 'staphb/raven:latest'
+    publishDir "${params.outdir}/ont/assembly", mode: 'copy'
 
     input:
-    path reads
+    tuple val(sample_id), path(reads)
 
     output:
-    path "assembly.fasta"
-
-    container 'staphb/raven:latest'
+    tuple val(sample_id), path("assembly.fasta")
 
     script:
     """
-    ls -lh
-    raven -t 1 $reads > assembly.fasta
+    raven -t 1 ${reads} > assembly.fasta
     """
 }
 
 process MEDAKA {
 
+    container 'staphb/medaka:latest'
+    publishDir "${params.outdir}/ont/medaka", mode: 'copy'
     cpus 2
-    memory '6 GB'
 
     input:
-    tuple path(reads), path(assembly)
+    tuple val(sample_id), path(assembly), path(reads)
 
     output:
-    path "consensus.fasta"
+    tuple val(sample_id), path("consensus.fasta")
 
     script:
     """
     medaka_consensus \
-      -i ${reads} \
-      -d ${assembly} \
-      -o medaka_out \
-      -t ${task.cpus}
+        -i ${reads} \
+        -d ${assembly} \
+        -o medaka_out \
+        -t ${task.cpus} \
+	-b 40
 
     cp medaka_out/consensus.fasta .
     """
 }
 
-process EL_GATO_ONT {
+// ======================================================
+// ONT FAN-OUT TOOLS
+// ======================================================
 
-    container 'staphb/elgato:1.22.0'
-
-    publishDir "${params.outdir}/ont/el_gato", mode: 'copy', overwrite: true
+process NANOPLOT {
+    container 'staphb/nanoplot:latest'
+    publishDir "${params.outdir}/ont/nanoplot", mode: 'copy'
+    cpus 2
 
     input:
-    path fasta
+    tuple val(sample_id), path(reads)
 
     output:
-    path "ont_result"
+    path "nanoplot/NanoPlot-report.html"
 
     script:
     """
-    el_gato.py \
-      --assembly ${fasta} \
-      --out ont_result
+    NanoPlot --fastq ${reads} -o nanoplot --threads ${task.cpus}
+    """
+}
+
+process CHECKM {
+
+    container 'staphb/checkm:latest'
+    publishDir "${params.outdir}/ont/checkm", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(fasta)
+
+    output:
+    path "checkm.tsv"
+
+    script:
+    """
+    mkdir -p in
+    cp ${fasta} in/
+
+    checkm taxon_set genus Legionella legionella || true
+    checkm analyze legionella in out -x fasta
+    checkm qa legionella out -f checkm.tsv -o 2
+    """
+}
+
+process PROKKA {
+    container 'staphb/prokka:latest'
+    publishDir "${params.outdir}/ont/prokka", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(fasta)
+
+    output:
+    val sample_id, emit: id
+    // 给路径套上 sample_id，形成 tuple
+    tuple val(sample_id), path("prokka/${sample_id}.gff"), emit: gff
+    tuple val(sample_id), path("prokka/${sample_id}.faa"), emit: faa
+
+    script:
+    """
+    prokka \
+        --outdir prokka \
+        --prefix ${sample_id} \
+        --cpus ${task.cpus} \
+        ${fasta}
+    """
+}
+
+process CHECKM2 {
+    container 'staphb/checkm2:latest'
+    publishDir "${params.outdir}/ont/checkm2", mode: 'copy'
+    cpus 4
+    memory '4 GB'
+
+    input:
+    tuple val(sample_id), path(fasta)
+
+    output:
+    path "checkm2_out/quality_report.tsv"
+
+    script:
+    """
+    checkm2 predict \
+        --input ${fasta} \
+        --output-directory checkm2_out \
+        --threads ${task.cpus} \
+        --database_path /mnt/checkm2_db/uniref100.KO.1.dmnd \
+        --force
+    """
+}
+process AMRFINDER {
+
+    container 'staphb/ncbi-amrfinderplus:3.12.8' 
+    publishDir "${params.outdir}/ont/amrfinder", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(gff), path(faa)
+
+    output:
+    path "${sample_id}_amr.tsv"
+
+    script:
+    """
+    amrfinder \
+        -g ${gff} \
+        -p ${faa} \
+        -a prokka \
+        --plus \
+        -o ${sample_id}_amr.tsv
+    """
+}
+process EL_GATO_ONT {
+
+    container 'staphb/elgato:1.22.0'
+    publishDir "${params.outdir}/ont/el_gato", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(fasta)
+
+    output:
+    path "report.json"
+
+    script:
+    """
+    el_gato.py --assembly ${fasta} --out report.json
     """
 }
 
 // ======================================================
-// WORKFLOW (FIXED ROUTER)
+// WORKFLOW ROUTER (SAFE)
 // ======================================================
 
 workflow {
 
-    // ==================================================
-    // MODE 1: FASTQ
-    // ==================================================
+    // =========================
+    // ILLUMINA FASTQ
+    // =========================
     if( params.read1 && params.read2 ) {
 
-        log.info "RUNNING MODE 1: ILLUMINA FASTQ"
+        Channel.of(tuple(params.sample_id, file(params.read1), file(params.read2)))
+            .set { illumina_ch }
 
-        Channel.of(
-            tuple(
-                params.sample_id,
-                file(params.read1),
-                file(params.read2)
-            )
-        ).set { reads_ch }
-
-        EL_GATO_FASTQ(reads_ch)
+        EL_GATO_FASTQ(illumina_ch)
     }
 
-    // ==================================================
-    // MODE 2: FASTA
-    // ==================================================
+    // =========================
+    // ILLUMINA FASTA
+    // =========================
     else if( params.fasta ) {
-
-        log.info "RUNNING MODE 2: ILLUMINA FASTA"
 
         Channel.of(file(params.fasta))
             .set { fasta_ch }
@@ -208,29 +266,31 @@ workflow {
         EL_GATO_FASTA(fasta_ch)
     }
 
-    // ==================================================
-    // MODE 3: ONT
-    // ==================================================
-     else if( params.read1 ) {
+    // =========================
+    // ONT PIPELINE (FIXED & SAFE)
+    // =========================
+    else if( params.read1 ) {
 
-    log.info "RUNNING MODE 3: ONT PIPELINE (SINGLE FASTQ)"
+        log.info "RUNNING ONT PIPELINE (FINAL STABLE VERSION)"
 
-    // Single source channel
-    raw_reads = Channel.of(file(params.read1))
+        raw = Channel.of(tuple(params.sample_id, file(params.read1)))
 
-    // STEP 1: subsample
-    subsampled_reads = SUBSAMPLE_ONT(raw_reads)
+        subsampled = SUBSAMPLE_ONT(raw)
+        raven_out  = RAVEN(subsampled)
 
-    // STEP 2: assemble
-    raven_out = RAVEN(subsampled_reads)
+        medaka_in = raven_out.join(subsampled)
 
-    // STEP 3: pair reads + assembly
-    medaka_input = raw_reads.combine(raven_out)
+        polished = MEDAKA(medaka_in)
+        NANOPLOT(subsampled)
+        //CHECKM(polished)
+        CHECKM2(polished)
+        PROKKA(polished)
 
-    // STEP 4: polish
-    medaka_out = MEDAKA(medaka_input)
+        amr_input_ch = PROKKA.out.gff.join(PROKKA.out.faa)
 
-    // STEP 5: final tool
-    EL_GATO_ONT(medaka_out)
-}
+    // Now amr_input_ch is [sample_id, gff, faa]
+        AMRFINDER(amr_input_ch)
+
+        EL_GATO_ONT(polished)
+    }
 }
