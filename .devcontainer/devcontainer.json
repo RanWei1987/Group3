@@ -2,7 +2,16 @@
   "name": "el-gato-ont-dev",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
   "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/java:1": {},
+    "ghcr.io/devcontainers/features/python:1": {"version": "3.11"}
   },
-  "postCreateCommand": "bash .devcontainer/setup.sh"
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "forwardPorts": [8501],
+  "portsAttributes": {
+    "8501": {
+      "label": "Streamlit Dashboard",
+      "onAutoForward": "openBrowser"
+    }
+  }
 }
