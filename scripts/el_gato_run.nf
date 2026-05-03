@@ -4,17 +4,14 @@ nextflow.enable.dsl=2
 // ======================================================
 // PARAMETERS
 // ======================================================
-
+def timestamp = new Date().format('yyMMddHHmmss')
 params.read1     = null
 params.read2     = null
 params.fasta     = null
+params.samplesheet = null
 params.sample_id = "sample"
 params.outdir    = "results"
-params.checkm2_db  = "/mnt/checkm2_db/uniref100.KO.1.dmnd"
-params.dashboard   = "${projectDir}/dashboard.py"
-
-log.info "projectDir = ${projectDir}"
-
+params.run_id    = timestamp
 // ======================================================
 // ILLUMINA MODE
 // ======================================================
@@ -22,7 +19,7 @@ log.info "projectDir = ${projectDir}"
 process EL_GATO_FASTQ {
 
     container 'staphb/elgato:1.22.0'
-    publishDir "${params.outdir}/illumina_fastq", mode: 'copy'
+    publishDir "${params.outdir}/illumina_fastq/${params.run_id}", mode: 'copy'
 
     input:
     tuple val(sample_id), path(read1), path(read2)
@@ -39,7 +36,7 @@ process EL_GATO_FASTQ {
 process EL_GATO_FASTA {
 
     container 'staphb/elgato:1.22.0'
-    publishDir "${params.outdir}/illumina_fasta", mode: 'copy'
+    publishDir "${params.outdir}/illumina_fasta/${params.run_id}", mode: 'copy'
 
     input:
     path fasta
@@ -60,7 +57,7 @@ process EL_GATO_FASTA {
 process SUBSAMPLE_ONT {
 
     container 'staphb/seqtk:latest'
-    publishDir "${params.outdir}/ont/subsample", mode: 'copy'
+    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/subsample", mode: 'copy'
 
     input:
     tuple val(sample_id), path(reads)
@@ -76,8 +73,8 @@ process SUBSAMPLE_ONT {
 
 process RAVEN {
 
-    container 'quay.io/biocontainers/raven-assembler:1.8.3--h43eeafb_0'
-    publishDir "${params.outdir}/ont/assembly", mode: 'copy'
+    container 'staphb/raven:latest'
+    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/assembly", mode: 'copy'
 
     input:
     tuple val(sample_id), path(reads)
@@ -94,7 +91,7 @@ process RAVEN {
 process MEDAKA {
 
     container 'staphb/medaka:latest'
-    publishDir "${params.outdir}/ont/medaka", mode: 'copy'
+    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/medaka", mode: 'copy'
     cpus 2
 
     input:
@@ -122,7 +119,7 @@ process MEDAKA {
 
 process NANOPLOT {
     container 'staphb/nanoplot:latest'
-    publishDir "${params.outdir}/ont/nanoplot", mode: 'copy'
+    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/nanoplot", mode: 'copy'
     cpus 2
 
     input:
@@ -139,8 +136,8 @@ process NANOPLOT {
 
 process CHECKM {
 
-    container 'nanozoo/checkm:latest'
-    publishDir "${params.outdir}/ont/checkm", mode: 'copy'
+    container 'staphb/checkm:latest'
+    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/checkm", mode: 'copy'
 
     input:
     tuple val(sample_id), path(fasta)
@@ -161,14 +158,14 @@ process CHECKM {
 
 process PROKKA {
     container 'staphb/prokka:latest'
-    publishDir "${params.outdir}/ont/prokka", mode: 'copy'
+    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/prokka", mode: 'copy'
 
     input:
     tuple val(sample_id), path(fasta)
 
     output:
     val sample_id, emit: id
-    // 给路径套上 sample_id，形成 tuple
+
     tuple val(sample_id), path("prokka/${sample_id}.gff"), emit: gff
     tuple val(sample_id), path("prokka/${sample_id}.faa"), emit: faa
 
@@ -183,8 +180,8 @@ process PROKKA {
 }
 
 process CHECKM2 {
-    container 'nanozoo/checkm2:1.1.0--f5e828a'
-    publishDir "${params.outdir}/ont/checkm2", mode: 'copy'
+    container 'staphb/checkm2:latest'
+    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/checkm2", mode: 'copy'
     cpus 4
     memory '4 GB'
 
@@ -196,6 +193,13 @@ process CHECKM2 {
 
     script:
     """
+    ls /mnt
+    echo "=== DEBUG: mount content ==="
+ls -lah /mnt/checkm2_db || true
+echo "=== DEBUG: input file ==="
+ls -lah ${fasta}
+echo "=== DEBUG: pwd ==="
+pwd 
     checkm2 predict \
         --input ${fasta} \
         --output-directory checkm2_out \
@@ -207,7 +211,7 @@ process CHECKM2 {
 process AMRFINDER {
 
     container 'staphb/ncbi-amrfinderplus:3.12.8' 
-    publishDir "${params.outdir}/ont/amrfinder", mode: 'copy'
+    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/amrfinder", mode: 'copy'
 
     input:
     tuple val(sample_id), path(gff), path(faa)
@@ -228,7 +232,7 @@ process AMRFINDER {
 process EL_GATO_ONT {
 
     container 'staphb/elgato:1.22.0'
-    publishDir "${params.outdir}/ont/el_gato", mode: 'copy'
+    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/el_gato", mode: 'copy'
 
     input:
     tuple val(sample_id), path(fasta)
@@ -241,6 +245,8 @@ process EL_GATO_ONT {
     el_gato.py --assembly ${fasta} --out report.json
     """
 }
+
+
 
 // ======================================================
 // DASHBOARD BUILD AND LAUNCH
@@ -320,13 +326,28 @@ workflow {
     // =========================
     // ONT PIPELINE (FIXED & SAFE)
     // =========================
-    else if( params.read1 ) {
-
+    else if( params.samplesheet ) {
+        
         log.info "RUNNING ONT PIPELINE (FINAL STABLE VERSION)"
+        
+        sample_ch = Channel
+            .fromPath(params.samplesheet, checkIfExists: true)
+            .splitCsv(header: true)
+            .view{ row -> "${row.sample_id},    ${row.read1}"}
+            .map { row ->
+    println "DEBUG ROW RAW: ${row}"
+    println "DEBUG read1: ${row.read1}"
 
-        raw = Channel.of(tuple(params.sample_id, file(params.read1)))
+    assert row.read1 != null : "read1 is NULL for row: ${row}"
 
-        subsampled = SUBSAMPLE_ONT(raw)
+    tuple(row.sample_id, file(row.read1))
+}
+        
+
+
+        //raw = Channel.of(tuple(params.sample_id, file(params.read1)))
+
+        subsampled = SUBSAMPLE_ONT( sample_ch )
         raven_out  = RAVEN(subsampled)
 
         medaka_in = raven_out.join(subsampled)
