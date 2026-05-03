@@ -9,9 +9,11 @@ sudo apt-get install -y \
   git \
   graphviz
 
+# Dashboard dependencies
+pip install -r scripts/requirements.txt
+
 echo "Installing Nextflow..."
 curl -s https://get.nextflow.io | bash
 sudo mv nextflow /usr/local/bin/
 
 echo "Setup complete."
-``
