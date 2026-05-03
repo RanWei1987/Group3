@@ -1,21 +1,6 @@
 """
 Legionella Pipeline Dashboard
-A Streamlit dashboard for collating QC, assembly, SBT typing, and more
-from a long-read Legionella pneumophila sequencing pipeline.
-
-el gato: https://github.com/CDCgov/el_gato
-
-Can be launched manually (file upload UI) or automatically by the Nextflow
-pipeline with pre-loaded file paths passed as CLI arguments:
-
-    streamlit run dashboard.py -- \
-        --elgato    results/ont/el_gato/report.json \
-        --amrfinder results/ont/amrfinder/sample_amr.tsv \
-        --checkm    results/ont/checkm/checkm.tsv \
-        --nanoplot  results/ont/nanoplot/NanoPlot-report.html \
-        --consensus results/ont/medaka/consensus.fasta
-
-All arguments are optional — the app functions with any subset of files.
+Multi-sample support with per-sample caching, CheckM2 integration.
 """
 
 import argparse
@@ -30,49 +15,103 @@ import base64
 import hashlib
 from pathlib import Path
 from bs4 import BeautifulSoup
-import graphviz
 
 # ======================================================
 # CLI ARGUMENT PARSING
-# Streamlit passes extra args after '--' to sys.argv.
-# We parse them here before any Streamlit calls.
 # ======================================================
 
 def parse_cli_args():
-    """Parse file paths — works whether launched by Nextflow or manually."""
-    import os
-    
-    # Streamlit passes post-'--' args but may mangle sys.argv
-    # Use st.query_params as fallback, or read directly from the raw argv
+    """
+    Nextflow passes a directory of per-sample results, or individual file paths.
+    Support both --results_dir (preferred for multi-sample) and legacy single-file flags.
+    """
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--results_dir", default=None,
+                        help="Root results directory from Nextflow (ont/<run_id>/)")
+    # Legacy single-sample flags kept for backwards compat
     parser.add_argument("--elgato",    default=None)
     parser.add_argument("--amrfinder", default=None)
-    parser.add_argument("--checkm",    default=None)
+    parser.add_argument("--checkm2",   default=None)
     parser.add_argument("--nanoplot",  default=None)
     parser.add_argument("--consensus", default=None)
 
-    # Try everything after '--' first, then fall back to all args
     try:
         idx = sys.argv.index("--")
         arg_list = sys.argv[idx + 1:]
     except ValueError:
-        # '--' was stripped by Streamlit — try parsing all argv
         arg_list = sys.argv[1:]
 
     args, _ = parser.parse_known_args(arg_list)
+    return args
 
-    result = {}
-    for key in ("elgato", "amrfinder", "checkm", "nanoplot", "consensus"):
-        val = getattr(args, key)
-        if val and Path(val).exists():
-            result[key] = Path(val)
+
+CLI_ARGS = parse_cli_args()
+
+
+def discover_samples(results_dir: Path) -> dict[str, dict[str, Path | None]]:
+    """
+    Walk results_dir looking for per-sample sub-directories.
+    Expected layout:
+        results_dir/
+          <sample_id>/
+            nanoplot/NanoPlot-report.html
+            checkm2/checkm2_out/quality_report.tsv
+            medaka/consensus.fasta
+            el_gato/report.json
+            amrfinder/<sample_id>_amr.tsv
+    Returns {sample_id: {slot: Path}}
+    """
+    samples = {}
+    if not results_dir.is_dir():
+        return samples
+
+    for sample_dir in sorted(results_dir.iterdir()):
+        if not sample_dir.is_dir():
+            continue
+        sid = sample_dir.name
+        slot_map = {
+            "nanoplot":  _find(sample_dir, "nanoplot/nanoplot/NanoPlot-report.html"),
+            "checkm2":   _find(sample_dir, "checkm2/checkm2_out/quality_report.tsv")
+                         or _find(sample_dir, "checkm2/quality_report.tsv"),
+            "assembly":  _find(sample_dir, "medaka/consensus.fasta"),
+            "elgato":    _find(sample_dir, "el_gato/report.json"),
+            "amrfinder": _find_glob(sample_dir, "amrfinder/*_amr.tsv"),
+        }
+        samples[sid] = slot_map
+    return samples
+
+
+def _find(base: Path, rel: str) -> Path | None:
+    p = base / rel
+    return p if p.exists() else None
+
+
+def _find_glob(base: Path, pattern: str) -> Path | None:
+    hits = list(base.glob(pattern))
+    return hits[0] if hits else None
+
+
+def build_legacy_sample(args) -> dict | None:
+    """Build a single fake sample from legacy --elgato / --checkm2 etc. flags."""
+    slot_map = {}
+    for slot, attr, key in [
+        ("nanoplot",  "nanoplot",  "nanoplot"),
+        ("checkm2",   "checkm2",   "checkm2"),
+        ("assembly",  "consensus", "assembly"),
+        ("elgato",    "elgato",    "elgato"),
+        ("amrfinder", "amrfinder", "amrfinder"),
+    ]:
+        val = getattr(args, attr, None)
+        if val:
+            p = Path(val)
+            slot_map[slot] = p if p.exists() else None
         else:
-            result[key] = None
+            slot_map[slot] = None
 
-    return result
+    if any(v for v in slot_map.values()):
+        return {"legacy_sample": slot_map}
+    return None
 
-
-CLI_PATHS = parse_cli_args()
 
 # ======================================================
 # PAGE CONFIG
@@ -80,82 +119,141 @@ CLI_PATHS = parse_cli_args()
 
 st.set_page_config(
     page_title="Legionella Pipeline Dashboard",
-    page_icon="🧬",
+    page_icon=None,
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 st.markdown("""
 <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'IBM Plex Sans', sans-serif;
+    }
     .main-header {
         text-align: center;
-        background: linear-gradient(135deg, #1e3a8a, #3b82f6);
-        padding: 2rem;
-        border-radius: 15px;
-        margin-bottom: 2rem;
-        color: white;
+        background: linear-gradient(135deg, #0a0f1e 0%, #0d2137 50%, #0a1628 100%);
+        padding: 2.5rem 2rem;
+        border-radius: 12px;
+        margin-bottom: 1.5rem;
+        border: 1px solid #1e3a5f;
+        position: relative;
+        overflow: hidden;
     }
-    .upload-section {
-        background: linear-gradient(135deg, #f8fafc, #e2e8f0);
+    .main-header::before {
+        content: "";
+        position: absolute; inset: 0;
+        background: repeating-linear-gradient(
+            90deg,
+            transparent, transparent 39px,
+            rgba(30,90,140,0.12) 39px, rgba(30,90,140,0.12) 40px
+        ),
+        repeating-linear-gradient(
+            0deg,
+            transparent, transparent 39px,
+            rgba(30,90,140,0.12) 39px, rgba(30,90,140,0.12) 40px
+        );
+    }
+    .main-header h1 {
+        color: #e2f0ff;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 1.8rem;
+        font-weight: 600;
+        letter-spacing: 0.05em;
+        margin: 0;
+        position: relative;
+    }
+    .main-header p {
+        color: #7ab3d4;
+        font-size: 0.85rem;
+        letter-spacing: 0.12em;
+        margin-top: 0.5rem;
+        position: relative;
+        font-family: 'IBM Plex Mono', monospace;
+    }
+    .sample-bar {
+        background: #0d1f33;
+        border: 1px solid #1e3a5f;
+        border-radius: 8px;
+        padding: 1rem 1.25rem;
+        margin-bottom: 1.5rem;
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+    }
+    .stat-card {
+        background: #0d1f33;
+        border: 1px solid #1e3a5f;
+        padding: 1.1rem 1rem;
+        border-radius: 8px;
+        text-align: center;
+    }
+    .metric-value {
+        font-size: 1.6rem;
+        font-weight: 600;
+        color: #60b4f0;
+        font-family: 'IBM Plex Mono', monospace;
+        line-height: 1.1;
+    }
+    .metric-label {
+        color: #6a8fa8;
+        font-size: 0.75rem;
+        margin-top: 0.3rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+    .quality-good    { color: #34d399 !important; }
+    .quality-warning { color: #fbbf24 !important; }
+    .quality-poor    { color: #f87171 !important; }
+    .elgato-summary {
+        background: linear-gradient(135deg, #052e1c, #065f46);
+        border: 1px solid #059669;
         padding: 1.5rem;
         border-radius: 10px;
         margin: 1rem 0;
-        border: 2px dashed #64748b;
+        text-align: center;
+    }
+    .elgato-st {
+        font-size: 2.2rem;
+        font-weight: 600;
+        color: #6ee7b7;
+        font-family: 'IBM Plex Mono', monospace;
     }
     .file-status {
         display: inline-block;
-        padding: 0.25rem 0.75rem;
-        border-radius: 15px;
-        font-size: 0.8rem;
+        padding: 0.2rem 0.65rem;
+        border-radius: 12px;
+        font-size: 0.75rem;
         font-weight: 600;
         margin: 0.2rem;
+        font-family: 'IBM Plex Mono', monospace;
     }
-    .file-uploaded  { background-color: #10b981; color: white; }
-    .file-missing   { background-color: #ef4444; color: white; }
-    .file-autoloaded { background-color: #3b82f6; color: white; }
-    .module-card {
-        background: linear-gradient(135deg, #0f172a, #1e293b);
-        color: white;
-        padding: 1.5rem;
-        border-radius: 12px;
-        margin: 1rem 0;
-        border: 1px solid #475569;
-    }
-    .stat-card {
-        background: white;
-        padding: 1rem;
-        border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        text-align: center;
-        margin: 0.5rem 0;
-    }
-    .metric-value { font-size: 2rem; font-weight: bold; color: #1e40af; }
-    .metric-label { color: #64748b; font-size: 0.9rem; }
-    .quality-good    { color: #059669; font-weight: bold; }
-    .quality-warning { color: #d97706; font-weight: bold; }
-    .quality-poor    { color: #dc2626; font-weight: bold; }
-    .elgato-summary {
-        background: linear-gradient(135deg, #065f46, #047857);
-        color: white;
-        padding: 1.5rem;
-        border-radius: 10px;
-        margin: 1rem 0;
-    }
-    .elgato-st { font-size: 2rem; font-weight: bold; text-align: center; }
+    .file-uploaded   { background: #064e3b; color: #34d399; border: 1px solid #059669; }
+    .file-missing    { background: #3b0a0a; color: #f87171; border: 1px solid #dc2626; }
+    .file-autoloaded { background: #0c2a4a; color: #60b4f0; border: 1px solid #2563eb; }
     .autoload-banner {
-        background: linear-gradient(135deg, #1e40af, #3b82f6);
-        color: white;
-        padding: 0.75rem 1.25rem;
-        border-radius: 8px;
+        background: #0c2a4a;
+        border: 1px solid #2563eb;
+        color: #93c5fd;
+        padding: 0.6rem 1rem;
+        border-radius: 6px;
         margin-bottom: 1rem;
-        font-size: 0.95rem;
+        font-size: 0.85rem;
+        font-family: 'IBM Plex Mono', monospace;
+    }
+    .checkm2-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+        gap: 0.75rem;
+        margin: 1rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ======================================================
-# PARSING HELPERS  (cached so re-uploads don't reparse)
+# PARSING HELPERS
 # ======================================================
 
 @st.cache_data
@@ -211,49 +309,47 @@ def parse_assembly_fasta(content: str) -> dict:
 
 
 @st.cache_data
-def parse_checkm_tsv(content: str) -> dict:
+def parse_checkm2_tsv(content: str) -> dict:
     """
-    Parse CheckM TSV (-o 2 format).  Returns a dict with keys:
-      completeness, contamination, strain_heterogeneity, bin_id, lineage,
-      and also assembly-level fields if present (genome_size, num_contigs,
-      n50_contigs, mean_contig_length, longest_contig, coding_density).
+    Parse CheckM2 quality_report.tsv.
+    Expected columns (from real output):
+        Name, Completeness, Contamination, Completeness_Model_Used,
+        Translation_Table_Used, Coding_Density, Contig_N50, Average_Gene_Length,
+        Genome_Size, GC_Content, Total_Coding_Sequences, Total_Contigs,
+        Max_Contig_Length, Additional_Notes
+    Returns a flat dict of values.
     """
-    import re
-    lines = [l for l in content.splitlines() if l.strip() and not l.startswith("---")]
-    data = {}
+    df = pd.read_csv(StringIO(content), sep="\t")
+    if df.empty:
+        return {}
 
-    for line in lines:
-        # skip the header row
-        if "Completeness" in line and "Contamination" in line:
-            continue
-        parts = line.split()
-        if not parts:
-            continue
+    row = df.iloc[0]
 
-        # The -o 2 format has many columns; grab by regex for robustness
-        floats = re.findall(r"\d+\.\d+", line)
-        if len(floats) >= 3:
-            data["completeness"]          = float(floats[0])
-            data["contamination"]         = float(floats[1])
-            data["strain_heterogeneity"]  = float(floats[2])
+    def _get(col, cast=None):
+        if col in row.index and pd.notna(row[col]):
+            val = row[col]
+            try:
+                return cast(val) if cast else val
+            except Exception:
+                return val
+        return None
 
-        # Assembly columns present in -o 2 extended output
-        # Genome size, # contigs, N50 (contigs), mean contig length, longest contig
-        ints = re.findall(r"\b(\d{4,})\b", line)   # integers ≥ 4 digits = assembly stats
-        if len(ints) >= 1:
-            data["genome_size_bp"]      = int(ints[0]) if len(ints) > 0 else None
-            data["num_contigs"]         = int(ints[1]) if len(ints) > 1 else None
-            data["n50_contigs"]         = int(ints[2]) if len(ints) > 2 else None
-            data["mean_contig_len"]     = int(ints[3]) if len(ints) > 3 else None
-            data["longest_contig"]      = int(ints[4]) if len(ints) > 4 else None
-
-        # Bin ID and lineage (first two text tokens)
-        text_parts = [p for p in parts if not re.fullmatch(r"[\d.]+", p)]
-        if text_parts:
-            data["bin_id"]  = text_parts[0]
-            data["lineage"] = " ".join(text_parts[1:3]) if len(text_parts) > 1 else ""
-
-    return data
+    return {
+        "bin_id":                    _get("Name"),
+        "completeness":              _get("Completeness",              float),
+        "contamination":             _get("Contamination",             float),
+        "completeness_model":        _get("Completeness_Model_Used"),
+        "translation_table":         _get("Translation_Table_Used",    int),
+        "coding_density":            _get("Coding_Density",            float),
+        "contig_n50":                _get("Contig_N50",                int),
+        "average_gene_length":       _get("Average_Gene_Length",       float),
+        "genome_size":               _get("Genome_Size",               int),
+        "gc_content":                _get("GC_Content",                float),
+        "total_coding_sequences":    _get("Total_Coding_Sequences",    int),
+        "total_contigs":             _get("Total_Contigs",             int),
+        "max_contig_length":         _get("Max_Contig_Length",         int),
+        "additional_notes":          _get("Additional_Notes"),
+    }
 
 
 @st.cache_data
@@ -276,8 +372,7 @@ def get_file_hash(f) -> str:
     return ""
 
 
-def read_file(f) -> str | bytes | None:
-    """Read from an UploadedFile or a Path, return decoded string."""
+def read_file(f) -> str | None:
     if f is None:
         return None
     if isinstance(f, Path):
@@ -289,193 +384,243 @@ def read_file(f) -> str | bytes | None:
 
 
 # ======================================================
-# MAIN DASHBOARD CLASS
+# PER-SAMPLE CACHE  (stored in session_state)
+# ======================================================
+
+def ensure_sample_cache(sample_id: str):
+    if "sample_cache" not in st.session_state:
+        st.session_state.sample_cache = {}
+    if sample_id not in st.session_state.sample_cache:
+        st.session_state.sample_cache[sample_id] = {
+            "parsed": {},
+            "file_hashes": {},
+        }
+
+
+def get_sample_cache(sample_id: str) -> dict:
+    ensure_sample_cache(sample_id)
+    return st.session_state.sample_cache[sample_id]
+
+
+def parse_and_cache(sample_id: str, slot: str, source) -> None:
+    """Parse a file and store into per-sample cache."""
+    cache = get_sample_cache(sample_id)
+    content = read_file(source)
+    if content is None:
+        return
+    try:
+        if slot == "nanoplot":
+            cache["parsed"]["nanoplot"]  = parse_nanoplot_html(content)
+        elif slot == "assembly":
+            cache["parsed"]["assembly"]  = parse_assembly_fasta(content)
+        elif slot == "elgato":
+            cache["parsed"]["elgato"]    = parse_elgato_json(content)
+        elif slot == "checkm2":
+            cache["parsed"]["checkm2"]   = parse_checkm2_tsv(content)
+        elif slot == "amrfinder":
+            cache["parsed"]["amrfinder"] = parse_amrfinder_tsv(content)
+    except Exception as e:
+        st.warning(f"[{sample_id}] Could not parse {slot}: {e}")
+
+
+def load_sample_files(sample_id: str, slot_map: dict[str, Path | None]) -> None:
+    """Load all file slots for a sample into cache (idempotent via hash check)."""
+    cache = get_sample_cache(sample_id)
+    for slot, path in slot_map.items():
+        if path is None:
+            continue
+        h = get_file_hash(path)
+        if h != cache["file_hashes"].get(slot):
+            cache["file_hashes"][slot] = h
+            parse_and_cache(sample_id, slot, path)
+
+
+# ======================================================
+# MAIN DASHBOARD
 # ======================================================
 
 class LegionellaPipelineDashboard:
 
     def __init__(self):
-        self._init_session_state()
+        if "all_samples" not in st.session_state:
+            st.session_state.all_samples = {}    # {sample_id: slot_map}
+        if "active_sample" not in st.session_state:
+            st.session_state.active_sample = None
+        if "manual_slots" not in st.session_state:
+            st.session_state.manual_slots = {}   # slot -> UploadedFile (manual upload)
+        if "manual_hashes" not in st.session_state:
+            st.session_state.manual_hashes = {}
 
     # --------------------------------------------------
-    # SESSION STATE
+    # AUTO-DISCOVER SAMPLES FROM CLI / results_dir
     # --------------------------------------------------
 
-    def _init_session_state(self):
-        defaults = {
-            "uploaded_files": {k: None for k in
-                               ("nanoplot", "assembly", "elgato",
-                                "checkm", "amrfinder", "assembly_graph")},
-            "parsed_data":  {},
-            "file_hashes":  {},
-            "auto_loaded":  False,
-        }
-        for k, v in defaults.items():
-            if k not in st.session_state:
-                st.session_state[k] = v
+    def auto_discover(self):
+        if CLI_ARGS.results_dir:
+            rd = Path(CLI_ARGS.results_dir)
+            samples = discover_samples(rd)
+            if samples:
+                st.session_state.all_samples.update(samples)
+                if st.session_state.active_sample is None:
+                    st.session_state.active_sample = next(iter(samples))
+                return
+
+        legacy = build_legacy_sample(CLI_ARGS)
+        if legacy:
+            st.session_state.all_samples.update(legacy)
+            if st.session_state.active_sample is None:
+                st.session_state.active_sample = "legacy_sample"
 
     # --------------------------------------------------
-    # AUTO-LOAD FROM CLI PATHS (Nextflow integration)
+    # SIDEBAR: sample selector + manual upload
     # --------------------------------------------------
 
-    def auto_load_cli_files(self):
-        """
-        If the pipeline injected file paths via CLI args, load them into
-        session state once (idempotent — checked via hash).
-        """
-        mapping = {
-            "nanoplot":  CLI_PATHS.get("nanoplot"),
-            "elgato":    CLI_PATHS.get("elgato"),
-            "checkm":    CLI_PATHS.get("checkm"),
-            "amrfinder": CLI_PATHS.get("amrfinder"),
-            "assembly":  CLI_PATHS.get("consensus"),   # consensus.fasta → assembly slot
-        }
+    def render_sidebar(self):
+        with st.sidebar:
+            st.markdown("## Legionella Dashboard")
+            st.divider()
 
-        any_loaded = False
-        for slot, path in mapping.items():
-            if path is None:
-                continue
-            h = get_file_hash(path)
-            if h != st.session_state.file_hashes.get(f"cli_{slot}"):
-                st.session_state.file_hashes[f"cli_{slot}"] = h
-                st.session_state.uploaded_files[slot] = path
-                self._parse_file(slot, path)
-                any_loaded = True
+            # ---- Sample selector ----
+            all_sids = list(st.session_state.all_samples.keys())
 
-        if any_loaded:
-            st.session_state.auto_loaded = True
+            if all_sids:
+                st.markdown("### Sample")
+                chosen = st.selectbox(
+                    "Select sample",
+                    options=all_sids,
+                    index=all_sids.index(st.session_state.active_sample)
+                          if st.session_state.active_sample in all_sids else 0,
+                    key="sample_selectbox",
+                    label_visibility="collapsed",
+                )
+                st.session_state.active_sample = chosen
+                st.markdown(f"**{len(all_sids)}** sample(s) loaded")
+                st.divider()
 
-    def _parse_file(self, slot: str, source):
-        """Parse a file (Path or UploadedFile) into parsed_data."""
-        content = read_file(source)
-        if content is None:
-            return
-        try:
-            if slot == "nanoplot":
-                st.session_state.parsed_data["nanoplot"] = parse_nanoplot_html(content)
-            elif slot == "assembly":
-                st.session_state.parsed_data["assembly"] = parse_assembly_fasta(content)
-            elif slot == "elgato":
-                st.session_state.parsed_data["elgato"]   = parse_elgato_json(content)
-            elif slot == "checkm":
-                st.session_state.parsed_data["checkm"]   = parse_checkm_tsv(content)
-            elif slot == "amrfinder":
-                st.session_state.parsed_data["amrfinder"] = parse_amrfinder_tsv(content)
-            elif slot == "assembly_graph":
-                st.session_state.parsed_data["assembly_graph"] = content
-        except Exception as e:
-            st.warning(f"Could not parse {slot}: {e}")
+            # ---- Manual upload section ----
+            with st.expander("Upload Files", expanded=not all_sids):
+                manual_sid = st.text_input("Sample ID (for uploaded files)",
+                                           value="manual_sample")
+
+                nano = st.file_uploader("NanoPlot HTML",  type=["html"])
+                chk2 = st.file_uploader("CheckM2 TSV",    type=["tsv", "txt"])
+                asm  = st.file_uploader("Consensus FASTA", type=["fasta","fa","fna"])
+                elg  = st.file_uploader("El Gato JSON",   type=["json"])
+                amr  = st.file_uploader("AMRFinder TSV",  type=["tsv","txt"])
+
+                uploads = {
+                    "nanoplot":  nano,
+                    "checkm2":   chk2,
+                    "assembly":  asm,
+                    "elgato":    elg,
+                    "amrfinder": amr,
+                }
+
+                any_new = False
+                for slot, uf in uploads.items():
+                    if uf is not None:
+                        h = get_file_hash(uf)
+                        key = f"{manual_sid}_{slot}"
+                        if h != st.session_state.manual_hashes.get(key):
+                            st.session_state.manual_hashes[key] = h
+                            if manual_sid not in st.session_state.all_samples:
+                                st.session_state.all_samples[manual_sid] = {}
+                            st.session_state.all_samples[manual_sid][slot] = uf
+                            uf.seek(0)
+                            parse_and_cache(manual_sid, slot, uf)
+                            any_new = True
+
+                if any_new and st.session_state.active_sample is None:
+                    st.session_state.active_sample = manual_sid
+
+            # ---- Status badges for active sample ----
+            if st.session_state.active_sample:
+                st.divider()
+                st.markdown("### File Status")
+                sid = st.session_state.active_sample
+                slot_map = st.session_state.all_samples.get(sid, {})
+                cache = get_sample_cache(sid)
+                labels = {
+                    "nanoplot":  "NanoPlot",
+                    "checkm2":   "CheckM2",
+                    "assembly":  "Consensus",
+                    "elgato":    "El Gato",
+                    "amrfinder": "AMRFinder",
+                }
+                for slot, label in labels.items():
+                    src = slot_map.get(slot)
+                    parsed = cache["parsed"].get(slot)
+                    if parsed is not None:
+                        cls, icon = "file-uploaded", "+"
+                    elif src is not None:
+                        cls, icon = "file-autoloaded", "~"
+                    else:
+                        cls, icon = "file-missing", "-"
+                    st.markdown(
+                        f'<span class="file-status {cls}">{icon} {label}</span>',
+                        unsafe_allow_html=True,
+                    )
 
     # --------------------------------------------------
     # HEADER
     # --------------------------------------------------
 
     def render_header(self):
-        st.markdown("""
+        sid = st.session_state.active_sample or ""
+        st.markdown(f"""
         <div class="main-header">
-            <h1>🧬 Legionella Pipeline Dashboard</h1>
-            <p style="font-size:1.1rem;opacity:0.9;">
-                NanoPlot QC &nbsp;•&nbsp; Raven-Medaka Assembly &nbsp;•&nbsp;
-                CheckM Quality &nbsp;•&nbsp; AMRFinder &nbsp;•&nbsp; El Gato Typing
-            </p>
+            <h1>Legionella Pipeline Dashboard</h1>
+            <p>NANOPLOT QC &nbsp;·&nbsp; RAVEN-MEDAKA ASSEMBLY &nbsp;·&nbsp;
+               CHECKM2 &nbsp;·&nbsp; AMRFINDER &nbsp;·&nbsp; EL GATO TYPING</p>
         </div>
         """, unsafe_allow_html=True)
 
-        if st.session_state.auto_loaded:
-            loaded = [k for k, v in CLI_PATHS.items() if v is not None]
+    # --------------------------------------------------
+    # LOAD ACTIVE SAMPLE
+    # --------------------------------------------------
+
+    def load_active_sample(self) -> dict:
+        sid = st.session_state.active_sample
+        if not sid:
+            return {}
+        slot_map = st.session_state.all_samples.get(sid, {})
+        # Ensure file Paths are loaded into cache
+        path_slots = {k: v for k, v in slot_map.items() if isinstance(v, Path)}
+        if path_slots:
+            load_sample_files(sid, path_slots)
+        return get_sample_cache(sid)["parsed"]
+
+    # --------------------------------------------------
+    # TABS
+    # --------------------------------------------------
+
+    def render_tabs(self, parsed: dict):
+        sid = st.session_state.active_sample
+
+        # Sample pill
+        if sid:
             st.markdown(
-                f'<div class="autoload-banner">⚡ <strong>Auto-loaded from pipeline output:</strong> '
-                f'{", ".join(loaded)}</div>',
-                unsafe_allow_html=True
+                f'<div class="autoload-banner">Viewing sample: <strong>{sid}</strong></div>',
+                unsafe_allow_html=True,
             )
 
-    # --------------------------------------------------
-    # FILE UPLOAD SECTION  (manual upload — always shown)
-    # --------------------------------------------------
+        tab1, tab2, tab3 = st.tabs(["Read QC", "Assembly QC", "Results & Annotations"])
 
-    def render_file_upload_section(self):
-        with st.expander("📂 Upload / Replace Files", expanded=not st.session_state.auto_loaded):
-            self._render_status_badges()
-
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                st.markdown("**Quality Control**")
-                nano = st.file_uploader("NanoPlot Report (HTML)", type=["html"], key="nanoplot_up")
-                chk  = st.file_uploader("CheckM Output (TSV/TXT)", type=["tsv","txt"], key="checkm_up")
-
-            with col2:
-                st.markdown("**Assembly**")
-                asm  = st.file_uploader("Consensus FASTA", type=["fasta","fa","fna"], key="assembly_up")
-                gv   = st.file_uploader("Assembly Graph (GV/DOT)", type=["gv","dot"], key="graph_up")
-
-            with col3:
-                st.markdown("**Analysis Results**")
-                elg  = st.file_uploader("El Gato Report (JSON)", type=["json"], key="elgato_up")
-                amr  = st.file_uploader("AMRFinder Results (TSV)", type=["tsv","txt"], key="amr_up")
-
-            # Process any newly uploaded files
-            for slot, uploaded in [
-                ("nanoplot", nano), ("checkm", chk), ("assembly", asm),
-                ("assembly_graph", gv), ("elgato", elg), ("amrfinder", amr)
-            ]:
-                if uploaded is not None:
-                    h = get_file_hash(uploaded)
-                    if h != st.session_state.file_hashes.get(slot):
-                        st.session_state.file_hashes[slot] = h
-                        st.session_state.uploaded_files[slot] = uploaded
-                        uploaded.seek(0)
-                        self._parse_file(slot, uploaded)
-
-    def _render_status_badges(self):
-        labels = {
-            "nanoplot": "NanoPlot", "assembly": "Assembly FASTA",
-            "elgato": "El Gato JSON", "checkm": "CheckM TSV",
-            "amrfinder": "AMRFinder TSV", "assembly_graph": "Assembly Graph",
-        }
-        html = ""
-        for slot, label in labels.items():
-            src  = st.session_state.uploaded_files.get(slot)
-            auto = isinstance(src, Path)
-            if src is not None and auto:
-                cls, icon = "file-autoloaded", "⚡"
-            elif src is not None:
-                cls, icon = "file-uploaded", "✅"
-            else:
-                cls, icon = "file-missing", "❌"
-            html += f'<span class="file-status {cls}">{icon} {label}</span>'
-        st.markdown(html, unsafe_allow_html=True)
-
-        loaded = sum(1 for v in st.session_state.uploaded_files.values() if v is not None)
-        total  = len(st.session_state.uploaded_files)
-        st.progress(loaded / total)
-        st.caption(f"{loaded}/{total} files loaded")
-
-    # --------------------------------------------------
-    # MAIN MODULES
-    # --------------------------------------------------
-
-    def render_analysis_modules(self):
-        if not any(st.session_state.uploaded_files.values()):
-            st.info("Upload pipeline output files above to begin analysis.")
-            return
-
-        tab1, tab2, tab3 = st.tabs(["📊 Read QC", "🧱 Assembly QC", "🔬 Results & Annotations"])
         with tab1:
-            self._render_read_qc()
+            self._render_read_qc(parsed)
         with tab2:
-            self._render_assembly_qc()
+            self._render_assembly_qc(parsed)
         with tab3:
-            self._render_results()
+            self._render_results(parsed)
 
     # ---- Tab 1: Read QC ----------------------------------------
 
-    def _render_read_qc(self):
+    def _render_read_qc(self, parsed: dict):
         st.markdown("## Read Quality Control")
-        nano_data = st.session_state.parsed_data.get("nanoplot")
+        nano_data = parsed.get("nanoplot")
 
         if nano_data is None:
-            st.info("Upload a NanoPlot HTML report to view read quality metrics.")
+            st.info("No NanoPlot report loaded for this sample.")
             return
 
         stats = nano_data.get("stats", {})
@@ -498,25 +643,23 @@ class LegionellaPipelineDashboard:
 
     # ---- Tab 2: Assembly QC ------------------------------------
 
-    def _render_assembly_qc(self):
+    def _render_assembly_qc(self, parsed: dict):
         st.markdown("## Assembly Quality Control")
 
-        # --- CheckM section (primary assembly stats source) ------
-        checkm = st.session_state.parsed_data.get("checkm")
-        if checkm:
-            st.markdown("### CheckM Assembly Assessment")
-            self._render_checkm_stats(checkm)
+        checkm2 = parsed.get("checkm2")
+        if checkm2:
+            st.markdown("### CheckM2 Assembly Assessment")
+            self._render_checkm2(checkm2)
         else:
-            st.info("Upload a CheckM TSV to view assembly quality and completeness.")
+            st.info("No CheckM2 report loaded for this sample.")
 
         st.divider()
 
-        # --- FASTA contig stats (supplementary) ------------------
-        asm = st.session_state.parsed_data.get("assembly")
+        asm = parsed.get("assembly")
         if asm:
             st.markdown("### Contig Statistics (from FASTA)")
             s = asm["stats"]
-            c1, c2, c3 = st.columns(3)
+            cols = st.columns(3)
             pairs = [
                 ("Total Contigs",     f'{s["total_contigs"]:,}'),
                 ("Total Length (bp)", f'{s["total_length"]:,}'),
@@ -526,59 +669,49 @@ class LegionellaPipelineDashboard:
                 ("Mean Length (bp)",  f'{s["mean_length"]:,.0f}'),
             ]
             for idx, (label, val) in enumerate(pairs):
-                col = [c1, c2, c3][idx % 3]
-                col.markdown(
+                cols[idx % 3].markdown(
                     f'<div class="stat-card">'
                     f'<div class="metric-value">{val}</div>'
                     f'<div class="metric-label">{label}</div></div>',
                     unsafe_allow_html=True,
                 )
-
             lengths = [s["length"] for s in asm["sequences"]]
             fig = go.Figure(go.Histogram(x=lengths, nbinsx=30,
-                                         marker_color="#10b981", opacity=0.7))
-            fig.update_layout(title="Contig Length Distribution",
-                              xaxis_title="Length (bp)", yaxis_title="Count", height=350)
+                                         marker_color="#2563eb", opacity=0.8))
+            fig.update_layout(
+                title="Contig Length Distribution",
+                xaxis_title="Length (bp)", yaxis_title="Count", height=350,
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(13,31,51,0.8)",
+                font=dict(color="#93c5fd"),
+            )
             st.plotly_chart(fig, use_container_width=True)
 
-        # --- Assembly graph --------------------------------------
-        gv_content = st.session_state.parsed_data.get("assembly_graph")
-        if gv_content:
-            st.markdown("### Assembly Graph")
-            try:
-                st.graphviz_chart(gv_content)
-            except Exception:
-                st.warning("Could not render graph — showing raw DOT source.")
-                st.code(gv_content, language="dot")
-
-    def _render_checkm_stats(self, d: dict):
-        """Render CheckM completeness, contamination, and assembly stats."""
-        comp  = d.get("completeness")
-        cont  = d.get("contamination")
-        sh    = d.get("strain_heterogeneity")
+    def _render_checkm2(self, d: dict):
+        comp = d.get("completeness")
+        cont = d.get("contamination")
 
         if comp is None:
-            st.warning("CheckM QC values could not be parsed from the TSV.")
+            st.warning("CheckM2 QC values could not be parsed.")
             st.json(d)
             return
 
         # Quality verdict
         if comp >= 95 and cont <= 5:
-            st.success("🟢 **High Quality** — completeness ≥ 95%, contamination ≤ 5%")
+            st.success("High Quality — completeness >= 95%, contamination <= 5%")
         elif comp >= 90 and cont <= 10:
-            st.warning("🟡 **Medium Quality** — review assembly parameters")
+            st.warning("Medium Quality — review assembly parameters")
         else:
-            st.error("🔴 **Low Quality** — consider reassembly or additional filtering")
+            st.error("Low Quality — consider reassembly or additional filtering")
 
-        # Core QC metrics
-        c1, c2, c3 = st.columns(3)
+        # ---- Core QC row ----
         comp_cls = "quality-good" if comp >= 95 else "quality-warning" if comp >= 90 else "quality-poor"
         cont_cls = "quality-good" if cont <= 5  else "quality-warning" if cont <= 10  else "quality-poor"
 
+        c1, c2, c3 = st.columns(3)
         for col, label, val, cls in [
-            (c1, "Completeness",        f"{comp:.2f}%", comp_cls),
-            (c2, "Contamination",       f"{cont:.2f}%", cont_cls),
-            (c3, "Strain Heterogeneity",f"{sh:.2f}%" if sh is not None else "—", ""),
+            (c1, "Completeness",   f"{comp:.2f}%", comp_cls),
+            (c2, "Contamination",  f"{cont:.2f}%", cont_cls),
+            (c3, "Coding Density", f"{d['coding_density']:.3f}" if d.get("coding_density") else "—", ""),
         ]:
             col.markdown(
                 f'<div class="stat-card">'
@@ -587,51 +720,95 @@ class LegionellaPipelineDashboard:
                 unsafe_allow_html=True,
             )
 
-        # Assembly-level stats from CheckM extended output (-o 2)
-        assembly_fields = {
-            "Genome Size (bp)":      d.get("genome_size_bp"),
-            "# Contigs":             d.get("num_contigs"),
-            "N50 Contigs (bp)":      d.get("n50_contigs"),
-            "Mean Contig Len (bp)":  d.get("mean_contig_len"),
-            "Longest Contig (bp)":   d.get("longest_contig"),
-        }
-        available = {k: v for k, v in assembly_fields.items() if v is not None}
+        st.markdown("#### Assembly & Gene Statistics")
 
+        # ---- Extended stats grid ----
+        fields = [
+            ("Genome Size (bp)",        d.get("genome_size"),             None),
+            ("Total Contigs",           d.get("total_contigs"),            None),
+            ("Contig N50 (bp)",         d.get("contig_n50"),               None),
+            ("Max Contig Length (bp)",  d.get("max_contig_length"),        None),
+            ("GC Content",              d.get("gc_content"),               ".3f"),
+            ("Total CDS",               d.get("total_coding_sequences"),   None),
+            ("Avg Gene Length (bp)",    d.get("average_gene_length"),      ".1f"),
+            ("Translation Table",       d.get("translation_table"),        None),
+        ]
+
+        available = [(lbl, val, fmt) for lbl, val, fmt in fields if val is not None]
         if available:
-            st.markdown("#### Assembly Statistics (from CheckM)")
-            cols = st.columns(min(3, len(available)))
-            for i, (label, val) in enumerate(available.items()):
-                cols[i % 3].markdown(
+            cols = st.columns(min(4, len(available)))
+            for i, (label, val, fmt) in enumerate(available):
+                if fmt:
+                    display = format(val, fmt)
+                elif isinstance(val, int):
+                    display = f"{val:,}"
+                else:
+                    display = str(val)
+                cols[i % 4].markdown(
                     f'<div class="stat-card">'
-                    f'<div class="metric-value">{val:,}</div>'
+                    f'<div class="metric-value">{display}</div>'
                     f'<div class="metric-label">{label}</div></div>',
                     unsafe_allow_html=True,
                 )
 
-        # Lineage / bin info
-        if d.get("bin_id") or d.get("lineage"):
-            st.caption(f"Bin: {d.get('bin_id','')}   |   Lineage: {d.get('lineage','')}")
+        # ---- Gauge charts ----
+        col_g1, col_g2 = st.columns(2)
+        for col, title, value, max_val, good_thresh, color_good, color_warn in [
+            (col_g1, "Completeness (%)", comp, 100, 95, "#34d399", "#fbbf24"),
+            (col_g2, "Contamination (%)", cont, 20,  5, "#34d399", "#fbbf24"),
+        ]:
+            bar_color = color_good if (value >= good_thresh if title.startswith("C") and "ompl" in title
+                                       else value <= good_thresh) else color_warn
+            fig = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=value,
+                number={"suffix": "%", "font": {"color": bar_color, "size": 28,
+                                                "family": "IBM Plex Mono"}},
+                gauge={
+                    "axis": {"range": [0, max_val],
+                             "tickcolor": "#6a8fa8", "tickfont": {"color": "#6a8fa8"}},
+                    "bar": {"color": bar_color},
+                    "bgcolor": "#0d1f33",
+                    "borderwidth": 1, "bordercolor": "#1e3a5f",
+                    "steps": [{"range": [0, max_val], "color": "#071526"}],
+                },
+                title={"text": title, "font": {"color": "#93c5fd", "size": 14,
+                                               "family": "IBM Plex Sans"}},
+            ))
+            fig.update_layout(
+                height=220, margin=dict(t=40, b=10, l=20, r=20),
+                paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#93c5fd"),
+            )
+            col.plotly_chart(fig, use_container_width=True)
+
+        # Model info
+        model = d.get("completeness_model")
+        notes = d.get("additional_notes")
+        if model:
+            st.caption(f"Completeness model: {model}")
+        if notes and str(notes).lower() not in ("none", "nan", ""):
+            st.caption(f"Notes: {notes}")
 
     # ---- Tab 3: Results & Annotations --------------------------
 
-    def _render_results(self):
+    def _render_results(self, parsed: dict):
         st.markdown("## Results & Annotations")
 
-        elgato = st.session_state.parsed_data.get("elgato")
+        elgato = parsed.get("elgato")
         if elgato:
             st.markdown("### El Gato Sequence Typing")
             self._render_elgato(elgato)
         else:
-            st.info("Upload an El Gato JSON report to view sequence typing results.")
+            st.info("No El Gato report loaded for this sample.")
 
         st.divider()
 
-        amr = st.session_state.parsed_data.get("amrfinder")
+        amr = parsed.get("amrfinder")
         if amr is not None:
             st.markdown("### AMR Gene Annotations")
             self._render_amrfinder(amr)
         else:
-            st.info("Upload an AMRFinder TSV to view resistance gene annotations.")
+            st.info("No AMRFinder results loaded for this sample.")
 
     def _render_elgato(self, data: dict):
         try:
@@ -644,8 +821,8 @@ class LegionellaPipelineDashboard:
 
         st.markdown(f"""
         <div class="elgato-summary">
-            <div class="elgato-st">Sequence Type: {mlst.get("st", "ND")}</div>
-            <p style="text-align:center;margin-top:0.5rem;">Sample: {data.get("id","")}</p>
+            <div class="elgato-st">ST: {mlst.get("st", "ND")}</div>
+            <p style="color:#6ee7b7;margin:0.3rem 0 0;">Sample: {data.get("id","")}</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -688,7 +865,7 @@ class LegionellaPipelineDashboard:
 
     def _render_amrfinder(self, df: pd.DataFrame):
         if df.empty:
-            st.success("🟢 No AMR genes detected.")
+            st.success("No AMR genes detected.")
             return
 
         c1, c2, c3 = st.columns(3)
@@ -708,10 +885,14 @@ class LegionellaPipelineDashboard:
         if "Class" in df.columns:
             counts = df["Class"].value_counts()
             fig = go.Figure(go.Bar(
-                x=counts.index, y=counts.values, marker_color="#dc2626"
+                x=counts.index, y=counts.values, marker_color="#f87171"
             ))
-            fig.update_layout(title="AMR Class Distribution",
-                              xaxis_title="Class", yaxis_title="Count", height=350)
+            fig.update_layout(
+                title="AMR Class Distribution",
+                xaxis_title="Class", yaxis_title="Count", height=350,
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(13,31,51,0.8)",
+                font=dict(color="#93c5fd"),
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     # --------------------------------------------------
@@ -719,17 +900,20 @@ class LegionellaPipelineDashboard:
     # --------------------------------------------------
 
     def run(self):
-        self.auto_load_cli_files()
-
-        # Refuse to start if launched with no pipeline files at all
-        if not any(CLI_PATHS.values()) and not any(st.session_state.uploaded_files.values()):
-            st.error("Dashboard was launched without any pipeline output files. "
-                 "This app should be started automatically by the ONT pipeline.")
-            st.stop()
-
+        self.auto_discover()
+        self.render_sidebar()
         self.render_header()
-        self.render_file_upload_section()
-        self.render_analysis_modules()
+
+        if not st.session_state.all_samples:
+            st.info("Upload pipeline output files in the sidebar to get started.")
+            return
+
+        if not st.session_state.active_sample:
+            st.info("Select a sample from the sidebar.")
+            return
+
+        parsed = self.load_active_sample()
+        self.render_tabs(parsed)
 
 
 # ======================================================

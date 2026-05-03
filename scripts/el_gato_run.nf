@@ -5,20 +5,23 @@ nextflow.enable.dsl=2
 // PARAMETERS
 // ======================================================
 def timestamp = new Date().format('yyMMddHHmmss')
-params.read1     = null
-params.read2     = null
-params.fasta     = null
+
+params.read1       = null
+params.read2       = null
+params.fasta       = null
 params.samplesheet = null
-params.sample_id = "sample"
-params.outdir    = "results"
-params.run_id    = timestamp
+params.sample_id   = "sample"
+params.outdir      = "results"
+params.run_id      = timestamp
+params.checkm2_db  = "/mnt/checkm2_db"
+params.dashboard   = "${projectDir}/dashboard.py"
+
 // ======================================================
-// ILLUMINA MODE
+// ILLUMINA MODE — FASTQ
 // ======================================================
 
 process EL_GATO_FASTQ {
 
-    container 'staphb/elgato:1.22.0'
     publishDir "${params.outdir}/illumina_fastq/${params.run_id}", mode: 'copy'
 
     input:
@@ -33,9 +36,12 @@ process EL_GATO_FASTQ {
     """
 }
 
+// ======================================================
+// ILLUMINA MODE — FASTA
+// ======================================================
+
 process EL_GATO_FASTA {
 
-    container 'staphb/elgato:1.22.0'
     publishDir "${params.outdir}/illumina_fasta/${params.run_id}", mode: 'copy'
 
     input:
@@ -46,17 +52,16 @@ process EL_GATO_FASTA {
 
     script:
     """
-    el_gato.py --read1 ${fasta} --out ${fasta.baseName}
+    el_gato.py --assembly ${fasta} --out ${fasta.baseName}
     """
 }
 
 // ======================================================
-// ONT PIPELINE (CLEAN LINEAR DAG)
+// ONT PIPELINE — LINEAR ASSEMBLY DAG
 // ======================================================
 
 process SUBSAMPLE_ONT {
 
-    container 'staphb/seqtk:latest'
     publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/subsample", mode: 'copy'
 
     input:
@@ -73,7 +78,6 @@ process SUBSAMPLE_ONT {
 
 process RAVEN {
 
-    container 'staphb/raven:latest'
     publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/assembly", mode: 'copy'
 
     input:
@@ -84,15 +88,13 @@ process RAVEN {
 
     script:
     """
-    raven -t 1 ${reads} > assembly.fasta
+    raven -t ${task.cpus} ${reads} > assembly.fasta
     """
 }
 
 process MEDAKA {
 
-    container 'staphb/medaka:latest'
     publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/medaka", mode: 'copy'
-    cpus 2
 
     input:
     tuple val(sample_id), path(assembly), path(reads)
@@ -107,7 +109,7 @@ process MEDAKA {
         -d ${assembly} \
         -o medaka_out \
         -t ${task.cpus} \
-	-b 40
+        -b 40
 
     cp medaka_out/consensus.fasta .
     """
@@ -118,15 +120,14 @@ process MEDAKA {
 // ======================================================
 
 process NANOPLOT {
-    container 'staphb/nanoplot:latest'
+
     publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/nanoplot", mode: 'copy'
-    cpus 2
 
     input:
     tuple val(sample_id), path(reads)
 
     output:
-    path "nanoplot/NanoPlot-report.html"
+    tuple val(sample_id), path("nanoplot/NanoPlot-report.html")
 
     script:
     """
@@ -134,38 +135,35 @@ process NANOPLOT {
     """
 }
 
-process CHECKM {
+process CHECKM2 {
 
-    container 'staphb/checkm:latest'
-    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/checkm", mode: 'copy'
+    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/checkm2", mode: 'copy'
 
     input:
     tuple val(sample_id), path(fasta)
 
     output:
-    path "checkm.tsv"
+    tuple val(sample_id), path("checkm2_out/quality_report.tsv")
 
     script:
     """
-    mkdir -p in
-    cp ${fasta} in/
-
-    checkm taxon_set genus Legionella legionella
-    checkm analyze legionella in out -x fasta
-    checkm qa legionella out -f checkm.tsv -o 2
+    checkm2 predict \
+        --input ${fasta} \
+        --output-directory checkm2_out \
+        --threads ${task.cpus} \
+        --database_path ${params.checkm2_db} \
+        --force
     """
 }
 
 process PROKKA {
-    container 'staphb/prokka:latest'
+
     publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/prokka", mode: 'copy'
 
     input:
     tuple val(sample_id), path(fasta)
 
     output:
-    val sample_id, emit: id
-
     tuple val(sample_id), path("prokka/${sample_id}.gff"), emit: gff
     tuple val(sample_id), path("prokka/${sample_id}.faa"), emit: faa
 
@@ -179,45 +177,15 @@ process PROKKA {
     """
 }
 
-process CHECKM2 {
-    container 'staphb/checkm2:latest'
-    publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/checkm2", mode: 'copy'
-    cpus 4
-    memory '4 GB'
-
-    input:
-    tuple val(sample_id), path(fasta)
-
-    output:
-    path "checkm2_out/quality_report.tsv"
-
-    script:
-    """
-    ls /mnt
-    echo "=== DEBUG: mount content ==="
-ls -lah /mnt/checkm2_db || true
-echo "=== DEBUG: input file ==="
-ls -lah ${fasta}
-echo "=== DEBUG: pwd ==="
-pwd 
-    checkm2 predict \
-        --input ${fasta} \
-        --output-directory checkm2_out \
-        --threads ${task.cpus} \
-        -database_path ${params.checkm2_db} \
-        --force
-    """
-}
 process AMRFINDER {
 
-    container 'staphb/ncbi-amrfinderplus:3.12.8' 
     publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/amrfinder", mode: 'copy'
 
     input:
     tuple val(sample_id), path(gff), path(faa)
 
     output:
-    path "${sample_id}_amr.tsv"
+    tuple val(sample_id), path("${sample_id}_amr.tsv")
 
     script:
     """
@@ -229,16 +197,16 @@ process AMRFINDER {
         -o ${sample_id}_amr.tsv
     """
 }
+
 process EL_GATO_ONT {
 
-    container 'staphb/elgato:1.22.0'
     publishDir "${params.outdir}/ont/${params.run_id}/${sample_id}/el_gato", mode: 'copy'
 
     input:
     tuple val(sample_id), path(fasta)
 
     output:
-    path "report.json"
+    tuple val(sample_id), path("report.json")
 
     script:
     """
@@ -246,185 +214,116 @@ process EL_GATO_ONT {
     """
 }
 
-
-
 // ======================================================
-// DASHBOARD BUILD AND LAUNCH
+// DASHBOARD LAUNCH
+// Passes the per-run results directory so the dashboard
+// can auto-discover all samples within it.
 // ======================================================
 
 process LAUNCH_DASHBOARD {
-    cache    false   // always re-launch, never skip
+
+    cache false
 
     input:
-    val elgato_path
-    val amrfinder_path
-    val checkm_path
-    val nanoplot_path
-    val consensus_path
+    val ready        // just a trigger — actual paths are resolved from outdir
 
     output:
     stdout
 
     script:
-    def elgato_out    = "${launchDir}/${params.outdir}/ont/el_gato/report.json/report.json"
-    def amrfinder_out = "${launchDir}/${params.outdir}/ont/amrfinder/${params.sample_id}_amr.tsv"
-    def checkm_out    = "${launchDir}/${params.outdir}/ont/checkm/checkm.tsv"
-    def nanoplot_out  = "${launchDir}/${params.outdir}/ont/nanoplot/nanoplot/NanoPlot-report.html"
-    def consensus_out = "${launchDir}/${params.outdir}/ont/medaka/consensus.fasta"
+    def results_dir = "${launchDir}/${params.outdir}/ont/${params.run_id}"
     """
-    ARGS=""
-    [ -f ${elgato_out}    ] && ARGS="\$ARGS --elgato    ${elgato_out}"
-    [ -f ${amrfinder_out} ] && ARGS="\$ARGS --amrfinder ${amrfinder_out}"
-    [ -f ${checkm_out}    ] && ARGS="\$ARGS --checkm    ${checkm_out}"
-    [ -f ${nanoplot_out}  ] && ARGS="\$ARGS --nanoplot  ${nanoplot_out}"
-    [ -f ${consensus_out} ] && ARGS="\$ARGS --consensus ${consensus_out}"
-
-    echo "ARGS built: \$ARGS"
-    echo "Dashboard: ${params.dashboard}"
-
-    # Run in background so Nextflow process can complete
-    nohup streamlit run ${params.dashboard} -- \$ARGS \
+    streamlit run ${params.dashboard} \
+        -- \
+        --results_dir ${results_dir} \
         > ${launchDir}/streamlit.log 2>&1 &
 
     echo "Streamlit PID: \$!"
-    echo "Dashboard launching at http://localhost:8501"
-    echo "Log: ${launchDir}/streamlit.log"
-
-    # Give it a moment to start then exit cleanly
+    echo "Dashboard : http://localhost:8501"
+    echo "Results   : ${results_dir}"
+    echo "Log       : ${launchDir}/streamlit.log"
     sleep 5
     """
 }
 
 // ======================================================
-// WORKFLOW ROUTER (SAFE)
+// WORKFLOW ROUTER
 // ======================================================
 
 workflow {
 
-    // =========================
-    // ILLUMINA FASTQ
-    // =========================
-    if( params.read1 && params.read2 ) {
+    // --------------------------------------------------
+    // ILLUMINA PE FASTQ
+    // --------------------------------------------------
+    if ( params.read1 && params.read2 ) {
 
-        Channel.of(tuple(params.sample_id, file(params.read1), file(params.read2)))
+        Channel
+            .of( tuple(params.sample_id, file(params.read1), file(params.read2)) )
             .set { illumina_ch }
 
         EL_GATO_FASTQ(illumina_ch)
     }
 
-    // =========================
-    // ILLUMINA FASTA
-    // =========================
-    else if( params.fasta ) {
+    // --------------------------------------------------
+    // ILLUMINA / ASSEMBLY FASTA
+    // --------------------------------------------------
+    else if ( params.fasta ) {
 
-        Channel.of(file(params.fasta))
+        Channel
+            .of( file(params.fasta) )
             .set { fasta_ch }
 
         EL_GATO_FASTA(fasta_ch)
     }
 
-    // =========================
-    // ONT PIPELINE (FIXED & SAFE)
-    // =========================
-    else if( params.samplesheet ) {
-        
-        log.info "RUNNING ONT PIPELINE (FINAL STABLE VERSION)"
-        
+    // --------------------------------------------------
+    // ONT — MULTI-SAMPLE VIA SAMPLESHEET
+    // --------------------------------------------------
+    else if ( params.samplesheet ) {
+
+        log.info "ONT multi-sample pipeline | run_id: ${params.run_id}"
+
         sample_ch = Channel
             .fromPath(params.samplesheet, checkIfExists: true)
             .splitCsv(header: true)
-            .view{ row -> "${row.sample_id},    ${row.read1}"}
             .map { row ->
-    println "DEBUG ROW RAW: ${row}"
-    println "DEBUG read1: ${row.read1}"
+                assert row.sample_id : "Missing sample_id in samplesheet row: ${row}"
+                assert row.read1     : "Missing read1 in samplesheet row: ${row}"
+                tuple(row.sample_id, file(row.read1, checkIfExists: true))
+            }
 
-    assert row.read1 != null : "read1 is NULL for row: ${row}"
+        // ---- Linear assembly ----
+        subsampled = SUBSAMPLE_ONT(sample_ch)
+        assembled  = RAVEN(subsampled)
+        polished   = MEDAKA( assembled.join(subsampled) )
 
-    tuple(row.sample_id, file(row.read1))
-}
-        
+        // ---- Fan-out from subsampled reads ----
+        nanoplot_out  = NANOPLOT(subsampled)
 
+        // ---- Fan-out from polished assembly ----
+        checkm2_out   = CHECKM2(polished)
+        prokka_out    = PROKKA(polished)
+        elgato_out    = EL_GATO_ONT(polished)
 
-        //raw = Channel.of(tuple(params.sample_id, file(params.read1)))
+        // ---- AMRFinder needs GFF + FAA from Prokka ----
+        amr_out = AMRFINDER( prokka_out.gff.join(prokka_out.faa) )
 
-        subsampled = SUBSAMPLE_ONT( sample_ch )
-        raven_out  = RAVEN(subsampled)
+        // ---- Wait for all samples to finish, then launch dashboard - collect() ensues we wait for every sample before triggering
+        trigger_ch = checkm2_out
+            .mix( nanoplot_out, elgato_out, amr_out )
+            .map { sid, f -> f.toString() }
+            .collect()
+            .map { "done" }
 
-        medaka_in = raven_out.join(subsampled)
-
-        polished = MEDAKA(medaka_in)
-        NANOPLOT(subsampled)
-        CHECKM(polished)
-        //CHECKM2(polished)
-        PROKKA(polished)
-
-        amr_input_ch = PROKKA.out.gff.join(PROKKA.out.faa)
-
-    // Now amr_input_ch is [sample_id, gff, faa]
-        AMRFINDER(amr_input_ch)
-
-        EL_GATO_ONT(polished)
-
-    // ifEmpty("MISSING") is a trick to make sure that each input produces one single value that goes to the dashboard - so even if onoe of these processes fails, all five inputs still exist
-        // elgato_path    = EL_GATO_ONT.out
-        //                     .map  { f -> f.toString() }
-        //                     .ifEmpty( "MISSING" )
-
-        // amrfinder_path = AMRFINDER.out
-        //                     .map  { f -> f.toString() }
-        //                     .ifEmpty( "MISSING" )
-
-        // checkm_path    = CHECKM.out
-        //                     .map  { f -> f.toString() }
-        //                     .ifEmpty( "MISSING" )
-
-        // nanoplot_path  = NANOPLOT.out
-        //                     .map  { f -> f.toString() }
-        //                     .ifEmpty( "MISSING" )
-
-        // consensus_path = polished
-        //                     .map  { sid, f -> f.toString() }
-        //                     .ifEmpty( "MISSING" )
-        // Replace the individual channel mappings with this
-    Channel.empty()
-        .mix(
-            EL_GATO_ONT.out.map { f -> f.toString() },
-            AMRFINDER.out.map { f -> f.toString() },
-            CHECKM.out.map { f -> f.toString() },
-            NANOPLOT.out.map { f -> f.toString() },
-            polished.map { sid, f -> f.toString() }
-        )
-        .collect()
-        .map { paths ->
-            def findPath = { name -> paths.find { it.contains(name) } ?: "MISSING" }
-            [
-                findPath("report.json"),
-                findPath("_amr.tsv"),
-                findPath("checkm.tsv"),
-                findPath("NanoPlot-report.html"),
-                findPath("consensus.fasta")
-            ]
-        }
-        .set { dashboard_inputs }
-
-        LAUNCH_DASHBOARD(
-            dashboard_inputs.map { it[0] },
-            dashboard_inputs.map { it[1] },
-            dashboard_inputs.map { it[2] },
-            dashboard_inputs.map { it[3] },
-            dashboard_inputs.map { it[4] }
-        )
-        // LAUNCH_DASHBOARD(
-        //     elgato_path,
-        //     amrfinder_path,
-        //     checkm_path,
-        //     nanoplot_path,
-        //     consensus_path
-        // )
+        LAUNCH_DASHBOARD(trigger_ch)
     }
 
-    // error message for if user messes up inputs
     else {
-        error "No valid input provided. Use --read1 (ONT), --read1 + --read2 (Illumina PE), or --fasta."
+        error """
+        No valid input provided. Choose one of:
+          --samplesheet  samplesheet.csv   (ONT, multi-sample)
+          --read1 R1.fq --read2 R2.fq      (Illumina PE)
+          --fasta assembly.fa              (assembly / Illumina FASTA)
+        """
     }
 }
